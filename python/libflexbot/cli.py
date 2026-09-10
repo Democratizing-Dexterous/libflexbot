@@ -1,4 +1,4 @@
-"""Interactive debugging entry point for the libflexbot SDK.
+"""Command line entry points for the libflexbot SDK.
 
 The installed ``flexcli`` console script behaves like ``python -i cli.py``:
 it configures the CAN-FD device and the robot from a YAML file, enables the
@@ -12,6 +12,12 @@ motors and then drops into a Python shell with the live objects in scope.
       exit() or Ctrl-D to quit; enabled motors are disabled on exit
 
     >>> robot.getj()["pos"]
+
+The installed ``flexzero`` console script reuses the same connection options
+but only sends the ``set_zero`` frame to every configured motor, leaving the
+control loop stopped:
+
+    $ flexzero config/motors.yaml
 """
 
 import argparse
@@ -25,18 +31,23 @@ import numpy as np
 
 from . import MODES, CanFD, Robot
 
-__all__ = ["build_parser", "parse_args", "bring_up", "interact", "main"]
+__all__ = [
+    "build_parser",
+    "build_zero_parser",
+    "parse_args",
+    "bring_up",
+    "interact",
+    "main",
+    "zero_main",
+]
 
 # Keeps the live objects alive until interpreter shutdown, so the atexit handler
 # can stop the control loop while the device is still open.
 _SESSION = None
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(
-        prog="flexcli",
-        description="Set up a libflexbot robot from a YAML config and open an interactive shell.",
-    )
+def _add_device_args(parser):
+    """Add the CAN-FD connection options shared by flexcli and flexzero."""
     parser.add_argument(
         "config",
         type=Path,
@@ -76,6 +87,15 @@ def build_parser():
         default=1,
         help="CAN channel index, zero based (default: %(default)s)",
     )
+    return parser
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="flexcli",
+        description="Set up a libflexbot robot from a YAML config and open an interactive shell.",
+    )
+    _add_device_args(parser)
     parser.add_argument(
         "--freq",
         type=int,
@@ -117,19 +137,28 @@ def build_parser():
     return parser
 
 
+def build_zero_parser():
+    parser = argparse.ArgumentParser(
+        prog="flexzero",
+        description=(
+            "Send set_zero to every motor in a libflexbot YAML config. "
+            "The control loop stays stopped, so the motors must not be enabled."
+        ),
+    )
+    _add_device_args(parser)
+    return parser
+
+
 def parse_args(argv=None):
     return build_parser().parse_args(argv)
 
 
-def bring_up(args, namespace=None):
-    """Create the device and robot described by ``args``.
+def _open_robot(args, namespace, *, mode, freq, soft_limit):
+    """Create the device and robot described by ``args`` without enabling it.
 
     Live objects are stored in ``namespace`` as soon as they exist, so a caller
     that catches an error can still inspect whatever came up. Raises on failure.
     """
-    if namespace is None:
-        namespace = {}
-
     config = Path(args.config).expanduser()
     if not config.is_file():
         raise FileNotFoundError(f"config file not found: {config}")
@@ -142,15 +171,34 @@ def bring_up(args, namespace=None):
     robot = Robot(
         canfd,
         can_channel=args.channel,
-        freq=args.freq,
+        freq=freq,
         config=config,
-        soft_limit=args.soft_limit,
-        mode=args.mode,
+        soft_limit=soft_limit,
+        mode=mode,
     )
     namespace["robot"] = robot
+    return namespace
+
+
+def bring_up(args, namespace=None):
+    """Create the device and robot described by ``args`` and enable the motors.
+
+    Live objects are stored in ``namespace`` as soon as they exist, so a caller
+    that catches an error can still inspect whatever came up. Raises on failure.
+    """
+    if namespace is None:
+        namespace = {}
+
+    _open_robot(
+        args,
+        namespace,
+        mode=args.mode,
+        freq=args.freq,
+        soft_limit=args.soft_limit,
+    )
 
     if args.enable:
-        robot.enable(cpu=args.cpu)
+        namespace["robot"].enable(cpu=args.cpu)
 
     return namespace
 
@@ -198,6 +246,39 @@ def main(argv=None):
         )
     interact(namespace)
     return 0 if ok else 1
+
+
+def zero_main(argv=None):
+    """Console entry point for ``flexzero``: set_zero on every configured motor.
+
+    The control loop is deliberately left stopped: set_zero only takes effect
+    while no control frame is being streamed to the motor.
+    """
+    args = build_zero_parser().parse_args(argv)
+    namespace = {}
+    try:
+        _open_robot(args, namespace, mode="mit", freq=1000, soft_limit=False)
+    except Exception as ex:
+        print(f"flexzero: setup failed: {ex}", file=sys.stderr)
+        return 1
+
+    robot = namespace["robot"]
+    canfd = namespace["canfd"]
+    ids = robot.motor_ids
+    print(f"flexzero: sending set_zero to {len(ids)} motor(s): {ids}")
+    failed = []
+    for motor_id in ids:
+        if robot.set_zero(motor_id):
+            print(f"flexzero: j{motor_id} set_zero ok")
+        else:
+            print(f"flexzero: j{motor_id} set_zero FAILED: {robot.last_error}", file=sys.stderr)
+            failed.append(motor_id)
+    canfd.close()
+    if failed:
+        print(f"flexzero: failed for motor(s) {failed}", file=sys.stderr)
+        return 1
+    print("flexzero: done")
+    return 0
 
 
 if __name__ == "__main__":

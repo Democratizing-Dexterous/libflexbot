@@ -68,7 +68,12 @@ setup(
     include_package_data=False,
     ext_modules=[Extension("libflexbot._libflexbot", sources=[])],
     cmdclass={"build_ext": CMakeBuild},
-    entry_points={"console_scripts": ["flexcli=libflexbot.cli:main"]},
+    entry_points={
+        "console_scripts": [
+            "flexcli=libflexbot.cli:main",
+            "flexzero=libflexbot.cli:zero_main",
+        ]
+    },
     python_requires=">=3.8",
     install_requires=["numpy"],
 )

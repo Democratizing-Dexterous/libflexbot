@@ -40,7 +40,7 @@ flowchart TD
 | 控制核心 | `src/robot.cpp`、`include/libflexbot/robot.hpp` | 控制线程、发送节奏、反馈解析、超时/错误/软限位处理、CPU 绑核 |
 | 设备层 | `src/canfd.cpp`、`include/libflexbot/canfd.hpp` | 设备与通道管理、CAN/CAN-FD 收发、`dlopen` 厂商驱动 |
 | 协议层 | `include/libflexbot/frames.hpp`、`types.hpp` | MIT / PV / PVT / 模式寄存器报文编码与数据结构 |
-| 调试入口 | `python/libflexbot/cli.py`、`python/cli.py` | `flexcli` 命令行与交互式调试脚本 |
+| 调试入口 | `python/libflexbot/cli.py`、`python/cli.py` | `flexcli` 交互式调试与 `flexzero` 置零命令行 |
 
 设计要点：
 
@@ -60,6 +60,7 @@ flowchart TD
 - 提供 **NumPy 反馈接口**（`getj()`）与 **CAN 反馈超时 / 电机错误 / 软限位保护**
 - 提供 **控制线程绑核**（`enable(cpu=...)`）以降低调度抖动
 - 提供 **`flexcli` 交互式调试命令行**
+- 提供 **`flexzero` 一键置零命令行**（对 YAML 中所有电机发送 `set_zero`）
 
 ---
 
@@ -86,10 +87,11 @@ sudo apt install build-essential cmake libboost-python-dev libboost-numpy-dev \
 pip install -e .
 ```
 
-`pip install` 会调用 CMake 编译 C++ 扩展（产物放在 `build-pip/`），并把厂商驱动 `libcontrolcanfd.so` 一并打包进 Python 包。安装完成后会多出一个命令行工具：
+`pip install` 会调用 CMake 编译 C++ 扩展（产物放在 `build-pip/`），并把厂商驱动 `libcontrolcanfd.so` 一并打包进 Python 包。安装完成后会多出两个命令行工具：
 
 ```bash
 flexcli --help
+flexzero --help
 ```
 
 ---
@@ -168,7 +170,7 @@ robot.disable()                 # 停止控制线程并下发 disable 帧
 
 说明：
 
-- 浮点字段为 IEEE-754 **小端** float32；PVT 的限速与电流标幺值是无符号 16 位小端，超过 10000 会被限制到 10000。因此 `v_des` 实际幅值为 0~100 rad/s，`i_des` 为 0~1.0。
+- 浮点字段为 IEEE-754 **小端** float32；PVT 的限速与电流标幺值是无符号 16 位小端，超过 10000 会被限制到 10000。因此 `v_des` 实际幅值为 0-100 rad/s，`i_des` 为 0-1.0。
 - 模式寄存器报文发往 `0x7FF`，数据为 `[id, 0x00, 0x55, 0x0A]` 加 4 字节小端模式值。
 - `control_*` 系列只负责**存入目标**，真正的帧由控制线程按 `freq` 周期发送，和 `control_mit()` 的行为一致。
 - **模式不匹配**（例如 `mode="mit"` 时调用 `control_pv()`）不会发送任何帧，只在日志中记录 `ignore PV command ...` 并返回 `False`，**不会 disable 电机**——这不是致命错误。
@@ -224,7 +226,7 @@ robot2.enable(cpu=6)
 ```bash
 flexcli config/motors.yaml                 # 默认 mit 模式，CAN2，1000 Hz
 flexcli config/motors.yaml --mode pvt --cpu 5
-flexcli config/motors.yaml --no-enable     # 只打开设备不使能，此时不发帧也读不到反馈
+flexcli config/motors.yaml --no-enable     # 只打开设备不使能：getj() 读不到反馈，但可以 set_zero / 读写寄存器
 ```
 
 ```text
@@ -249,9 +251,32 @@ libflexbot interactive shell
 | `--device-index` / `--serial` | 多台设备时选择设备 |
 | `--abit` / `--bbit` | 仲裁域 / 数据域波特率，默认 `1000000` / `5000000` |
 | `--soft-limit` / `--no-soft-limit` | 是否启用 YAML 位置软限位，默认**关闭** |
-| `--no-enable` | 只配置不使能 |
+| `--no-enable` | 只配置不使能；`set_zero` / 寄存器读写必须在这种状态下做 |
 
 `flexcli --help` 可以查看全部参数。与 SDK 默认值不同，`flexcli` 默认**关闭软限位**，方便台架调试；需要限位保护时加 `--soft-limit`。
+
+> ⚠️ **`set_zero()` / `read_timeout()` / `write_timeout()`（以及 `read_register()` / `write_register()` / `save_register()`）必须在控制线程停止时调用**，也就是 `flexcli --no-enable` 打开的状态，或者代码里从未调用 `enable()` / 已经 `disable()`。控制线程运行时电机在持续接收控制帧，这些单帧的置零、寄存器指令可能被忽略，或与反馈帧混淆。要做这些操作：先 `disable()`（或 `--no-enable` 打开），做完再 `enable()`。
+
+---
+
+## 🎯 电机置零（flexzero）
+
+`pip install` 还会安装 `flexzero`：它对 YAML 里配置的**每一个电机**发送 `set_zero`。它复用 `flexcli` 的连接参数，但**不使能电机、也不进入交互终端**，正好满足上面「控制线程停止时读写电机」的要求。
+
+```bash
+flexzero config/motors.yaml
+flexzero config/motors.yaml --channel 1 --device-index 0 --serial USBCANFD212606183346
+```
+
+```text
+flexzero: sending set_zero to 1 motor(s): [1]
+flexzero: j1 set_zero ok
+flexzero: done
+```
+
+可用参数与 `flexcli` 的连接部分完全一致：`--device-index` / `--serial` / `--lib` / `--abit` / `--bbit` / `--channel`（`flexzero --help` 可查）。全部电机发送成功返回 `0`；任何一台失败返回 `1`，失败原因打印到 stderr，同时记录在该电机的 `robot.last_error` 里。
+
+> ⚠️ `set_zero` 会把电机**当前**位置记为新的零点，直接改变之后 `getj()["pos"]` 的读数。执行前请确认机械臂确实停在你要当作零点的位置。
 
 ---
 
@@ -301,15 +326,17 @@ robot_config:
 | `robot.control_mit(id, kp, kd, p_des, v_des, t_ff)` | MIT 模式命令 |
 | `robot.control_pv(id, p_des, v_des)` | PV 模式命令 |
 | `robot.control_pvt(id, p_des, v_des, i_des)` | PVT 模式命令 |
-| `robot.set_zero(id)` | 把当前位置存为零点 |
-| `robot.read_timeout(id)` | 读回电机的 CAN 反馈超时时间（毫秒，寄存器 `0x0933`） |
-| `robot.write_timeout(id, timeout)` | 写入电机的 CAN 反馈超时时间（毫秒，寄存器 `0x0955`），成功返回 `True` |
+| `robot.set_zero(id)` | 把当前位置存为零点（**需控制线程停止**） |
+| `robot.read_timeout(id)` | 读回电机的 CAN 反馈超时时间（毫秒，寄存器 `0x0933`；**需控制线程停止**） |
+| `robot.write_timeout(id, timeout)` | 写入电机的 CAN 反馈超时时间（毫秒，寄存器 `0x0955`），成功返回 `True`（**需控制线程停止**） |
 | `robot.read_register(id, register)` / `robot.write_register(id, register, value)` | 读写任意电机寄存器；`register` 为协议里的 16 位寄存器码（`0x33`+寄存器号 读、`0x55`+寄存器号 写，如读超时 `0x0933`、写超时 `0x0955`、写模式 `0x0A55`） |
 | `robot.save_register(id, rid=0)` | 让电机把寄存器保存到 flash（`0xAA` 指令，帧为 `[id, 0x00, 0xAA, rid]`），等电机应答后返回 `True`；`rid=0` 保存全部寄存器，指定 `rid` 只保存该寄存器 |
 | `robot.getj()` | 读取反馈：`pos`、`vel`、`tau`、`t_mos`、`t_rotor`、`timestamp`、`state`、`delay` |
 | `robot.mode` / `robot.running` / `robot.last_error` / `robot.motor_ids` | 当前模式、控制线程状态、最近一次错误、YAML 中的电机 id 列表 |
 
 `getj()` 返回的各字段都是与 `motor_ids` 顺序一致的 NumPy 数组；`delay` 是最近一帧反馈的年龄（毫秒），还没有收到反馈时为 `-1.0`。
+
+> ⚠️ 上表里 `set_zero()` / `read_timeout()` / `write_timeout()` 以及整个寄存器读写族（`read_register()` / `write_register()` / `save_register()`）都要求**控制线程处于停止状态**：即用 `flexcli --no-enable` 打开，或先 `robot.disable()`。控制线程运行时这几种单帧指令可能被持续的控制帧淹没、被电机忽略，回帧也容易与反馈帧混淆。命令行下最省事的方式是用 `flexzero` 置零、用 `flexcli --no-enable` 读写寄存器。
 
 ---
 
@@ -342,6 +369,7 @@ export LIBFLEXBOT_LOG_DIR=/tmp/libflexbot-logs
 
 - 程序退出时会自动 `disable()`（`atexit` + 析构），但**断电或控制丢失后机械臂会自由下坠**，请务必做好支撑与防护。
 - 首次上电建议先用 `flexcli --no-enable` 确认设备能打开、配置能正常加载，再使能观察反馈。
+- `set_zero`、`read_timeout`、`write_timeout` 等电机读写操作要在**控制线程停止**时做（`flexcli --no-enable`，或先 `disable()`）；置零前务必确认机械臂停在预期的零位，置零会立刻改变 `getj()["pos"]` 的读数。
 - 台架调试建议 `soft_limit=False`；正式运行请打开软限位，并认真核对 YAML 中的关节限位是否与实际安装一致。
 - PV / PVT 模式下电机持续跟随最后一个目标，调试时请把限速 `v_des` 与电流限幅 `i_des` 设小。
 
