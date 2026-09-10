@@ -6,24 +6,31 @@
 
 ## 🧱 SDK 整体架构
 
-```text
-        你的 Python 代码 / flexcli / python/cli.py
-                          │
-        python/libflexbot/__init__.py    CanFD、Robot 的 Python 薄封装
-                          │  Boost.Python
-        libflexbot._libflexbot           C++ 扩展模块（src/python_bindings.cpp）
-                          │
-        ┌─────────────────┴──────────────────┐
-        │      C++ 控制核心（静态库）           │
-        │  src/canfd.cpp   CanFD：设备/通道/收发 │
-        │  src/robot.cpp   Robot：控制线程/命令  │
-        │  frames.hpp      协议帧编码            │
-        │  types.hpp       模式/命令/反馈结构     │
-        └─────────────────┬──────────────────┘
-                          │ dlopen（运行时加载，编译期不链接）
-                  libcontrolcanfd.so            厂商 USB2CANFD 驱动
-                          │
-        USB2CANFD（CAN1 / CAN2）→ CAN-FD 总线 → 电机
+```mermaid
+flowchart TD
+    app["你的 Python 代码 / flexcli / python/cli.py"]
+    wrapper["python/libflexbot/__init__.py<br/>CanFD、Robot 的 Python 薄封装"]
+    binding["libflexbot._libflexbot<br/>C++ 扩展模块（src/python_bindings.cpp）"]
+
+    subgraph core["C++ 控制核心（静态库）"]
+        canfd["src/canfd.cpp<br/>CanFD：设备 / 通道 / 收发"]
+        robot["src/robot.cpp<br/>Robot：控制线程 / 命令"]
+        frames["frames.hpp<br/>协议帧编码"]
+        types["types.hpp<br/>模式 / 命令 / 反馈结构"]
+    end
+
+    driver["libcontrolcanfd.so<br/>厂商 USB2CANFD 驱动"]
+    usb["USB2CANFD（CAN1 / CAN2）"]
+    bus["CAN-FD 总线"]
+    motor["电机"]
+
+    app --> wrapper
+    wrapper -->|Boost.Python| binding
+    binding --> core
+    core -->|"dlopen（运行时加载，编译期不链接）"| driver
+    driver --> usb
+    usb --> bus
+    bus --> motor
 ```
 
 | 分层 | 位置 | 职责 |
