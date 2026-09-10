@@ -1,0 +1,49 @@
+# ---- 构建产物 ----
+build/
+build-pip/
+dist/
+*.egg-info/
+.eggs/
+
+# CMake 在源码树内生成的中间文件（out-of-source 构建时不会出现）
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+# 厂商驱动是运行时依赖，必须随仓库一起分发
+!libs/libcontrolcanfd.so
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 编译生成的扩展模块与打包进去的驱动副本（都由 cmake 构建时生成）
+python/libflexbot/_libflexbot*.so
+python/libflexbot/libcontrolcanfd.so
+
+# ---- 运行日志 ----
+logs/
+*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

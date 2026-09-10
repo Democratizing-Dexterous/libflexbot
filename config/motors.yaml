@@ -1,0 +1,25 @@
+motor_types:
+  dmj4310:
+    pmax: 12.5
+    vmax: 30.0
+    tmax: 10.0
+  dmj4340:
+    pmax: 12.5
+    vmax: 10.0
+    tmax: 28.0
+
+robot_config:
+  num_motors: 1
+  motor_configs:
+    - id: 1
+      type: dmj4340
+      limits:
+        position:
+          lower: -120.0  # degrees
+          upper: 120.0   # degrees
+    # - id: 2
+    #   type: dmj4340
+    #   limits:
+    #     position:
+    #       lower: -120.0  # degrees
+    #       upper: 120.0   # degrees
