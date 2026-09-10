@@ -25,7 +25,19 @@ constexpr uint8_t kClearErrorTail = 0xFB;
 constexpr uint8_t kEnableTail = 0xFC;
 constexpr uint8_t kDisableTail = 0xFD;
 constexpr uint8_t kSetZeroTail = 0xFE;
-constexpr auto kFeedbackTimeout = std::chrono::milliseconds(200);
+constexpr auto kFeedbackTimeout = std::chrono::milliseconds(3000);
+// The USB-CANFD link is not lossless: a single special frame or its reply can
+// be dropped, so the start sequence re-sends until it sees the answer.
+constexpr auto kSpecialRetryInterval = std::chrono::milliseconds(20);
+// A small gap between frames keeps a burst from overrunning the adapter's
+// transmit queue.
+constexpr auto kFrameGap = std::chrono::milliseconds(2);
+// Motors need a moment to apply a mode register write before they accept enable.
+constexpr auto kModeSettle = std::chrono::milliseconds(20);
+constexpr auto kModeAckTimeout = std::chrono::milliseconds(500);
+constexpr int kClearErrorAttempts = 3;
+constexpr uint8_t kModeWriteOp = static_cast<uint8_t>(kModeWriteCode & 0xFF);
+constexpr uint8_t kModeWriteRegister = static_cast<uint8_t>(kModeWriteCode >> 8);
 constexpr double kPi = 3.14159265358979323846;
 
 std::string error_state_message(size_t joint_index, uint8_t state)
@@ -76,6 +88,21 @@ bool is_register_reply(const CanFD::RxFrame &frame, uint32_t id, uint8_t op, uin
 {
     return frame.data.size() >= 4 && (frame.data[0] & 0x0F) == id && frame.data[1] == 0x00 &&
            frame.data[2] == op && (!check_rid || frame.data[3] == rid);
+}
+
+// A motor feedback frame and a register reply both start with the motor id in
+// data[0], so without this check a reply like [id, 0x00, 0x55, 0x0A, ...] would
+// be decoded as a (bogus) feedback frame and satisfy the enable handshake.
+// Register replies always carry 0x00 in data[1] and one of the register
+// operations in data[2].
+bool looks_like_register_reply(const CanFD::RxFrame &frame)
+{
+    if (frame.data.size() < 4 || frame.data[1] != 0x00)
+    {
+        return false;
+    }
+    const uint8_t op = frame.data[2];
+    return op == 0x33 || op == 0x55 || op == 0xAA;
 }
 
 double require_double(const YAML::Node &node, const std::string &name)
@@ -255,62 +282,96 @@ void Robot::stop_thread(bool send_disable)
 
 void Robot::send_start_sequence()
 {
+    // Drop frames left over from an earlier session or from a register exchange
+    // so they cannot be mistaken for the reply we wait for below.
+    drain_receive();
+
     for (const MotorConfig &motor : config_.motors)
     {
         const std::string joint = "j" + std::to_string(motor.id);
-        try
+        // Fire and forget, but repeat: if every copy is dropped the motor stays
+        // latched in its fault and the enable retries below cannot help.
+        for (int attempt = 0; attempt < kClearErrorAttempts; ++attempt)
         {
             if (!send_special(motor.id, kClearErrorTail))
             {
-                throw std::runtime_error("frame send failed");
+                log_event(joint + " clear_error failed: frame send failed");
+                throw std::runtime_error("clear error frame send failed for motor " + std::to_string(motor.id));
             }
-            log_event(joint + " clear_error ok");
+            std::this_thread::sleep_for(kFrameGap);
         }
-        catch (const std::exception &ex)
-        {
-            log_event(joint + " clear_error failed: " + ex.what());
-            throw std::runtime_error("clear error frame send failed for motor " + std::to_string(motor.id));
-        }
+        log_event(joint + " clear_error ok");
     }
+
     for (const MotorConfig &motor : config_.motors)
     {
         const std::string joint = "j" + std::to_string(motor.id);
-        try
+        const std::string mode = mode_name(mode_);
+        bool acknowledged = false;
+        const auto deadline = std::chrono::steady_clock::now() + kModeAckTimeout;
+        while (!acknowledged && std::chrono::steady_clock::now() < deadline)
         {
-            const std::string mode = mode_name(mode_);
             if (!canfd_.send_frame(can_channel_, kRegisterFrameId, mode_frame(motor.id, mode_)))
             {
-                throw std::runtime_error("frame send failed");
+                log_event(joint + " mode set failed: frame send failed");
+                throw std::runtime_error("mode frame send failed for motor " + std::to_string(motor.id));
             }
-            log_event(joint + " mode " + mode + " ok");
+            const auto window_end = std::chrono::steady_clock::now() + kSpecialRetryInterval;
+            while (!acknowledged && std::chrono::steady_clock::now() < window_end)
+            {
+                for (const auto &frame : canfd_.receive(can_channel_))
+                {
+                    if (is_register_reply(frame, motor.id, kModeWriteOp, kModeWriteRegister, true))
+                    {
+                        acknowledged = true;
+                    }
+                }
+                if (!acknowledged)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
         }
-        catch (const std::exception &ex)
-        {
-            log_event(joint + " mode set failed: " + ex.what());
-            throw std::runtime_error("mode frame send failed for motor " + std::to_string(motor.id));
-        }
+        // Verification is best effort: firmware that does not echo register
+        // writes must still reach the enable step, which is what really counts.
+        log_event(joint + " mode " + mode + (acknowledged ? " ok" : " ok (no register echo)"));
+        std::this_thread::sleep_for(kFrameGap);
     }
+
+    std::this_thread::sleep_for(kModeSettle);
+
     for (const MotorConfig &motor : config_.motors)
     {
         const std::string joint = "j" + std::to_string(motor.id);
-        try
+        bool acknowledged = false;
+        std::string reason;
+        const auto deadline = std::chrono::steady_clock::now() + kFeedbackTimeout;
+        while (!acknowledged)
         {
             if (!send_special(motor.id, kEnableTail))
             {
-                throw std::runtime_error("enable frame send failed");
+                log_event(joint + " enable failed: frame send failed");
+                throw std::runtime_error("enable frame send failed for motor " + std::to_string(motor.id));
             }
-            std::string reason;
-            if (!wait_for_feedback(motor.id, reason))
+            acknowledged = wait_for_feedback(motor.id, reason, kSpecialRetryInterval);
+            if (!acknowledged)
             {
-                throw std::runtime_error(reason);
+                if (!reason.empty())
+                {
+                    log_event(joint + " enable failed: " + reason);
+                    throw std::runtime_error("enable frame send failed for motor " +
+                                             std::to_string(motor.id));
+                }
+                if (std::chrono::steady_clock::now() >= deadline)
+                {
+                    log_event(joint + " enable failed: feedback timeout");
+                    throw std::runtime_error("enable frame send failed for motor " +
+                                             std::to_string(motor.id));
+                }
             }
-            log_event(joint + " enable ok");
         }
-        catch (const std::exception &ex)
-        {
-            log_event(joint + " enable failed: " + ex.what());
-            throw std::runtime_error("enable frame send failed for motor " + std::to_string(motor.id));
-        }
+        log_event(joint + " enable ok");
+        std::this_thread::sleep_for(kFrameGap);
     }
 }
 
@@ -347,9 +408,12 @@ void Robot::seed_mode_commands()
     }
 }
 
-bool Robot::wait_for_feedback(uint32_t id, std::string &reason)
+// Wait up to `window` for a real feedback frame from `id`. Register replies are
+// ignored, and `reason` is cleared on a plain timeout so the caller can tell a
+// silent motor apart from a motor that reported an error state.
+bool Robot::wait_for_feedback(uint32_t id, std::string &reason, std::chrono::milliseconds window)
 {
-    const auto deadline = std::chrono::steady_clock::now() + kFeedbackTimeout;
+    const auto deadline = std::chrono::steady_clock::now() + window;
     const size_t motor_index = index_by_id_.at(id);
 
     while (!stop_requested_.load() && std::chrono::steady_clock::now() < deadline)
@@ -357,7 +421,15 @@ bool Robot::wait_for_feedback(uint32_t id, std::string &reason)
         const auto frames = canfd_.receive(can_channel_);
         for (const auto &frame : frames)
         {
+            if (looks_like_register_reply(frame))
+            {
+                continue;
+            }
             if (!update_feedback_from_frame(frame))
+            {
+                continue;
+            }
+            if ((frame.data[0] & 0x0F) != id)
             {
                 continue;
             }
@@ -378,8 +450,20 @@ bool Robot::wait_for_feedback(uint32_t id, std::string &reason)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    reason = "feedback timeout";
+    reason.clear();
     return false;
+}
+
+void Robot::drain_receive()
+{
+    // Bounded so a busy bus cannot keep the start sequence here forever.
+    for (int i = 0; i < 64; ++i)
+    {
+        if (canfd_.receive(can_channel_).empty())
+        {
+            break;
+        }
+    }
 }
 
 void Robot::send_disable_all()
@@ -940,6 +1024,10 @@ void Robot::worker_loop()
             for (const auto &frame : frames)
             {
                 if (consume_register_reply(frame))
+                {
+                    continue;
+                }
+                if (looks_like_register_reply(frame))
                 {
                     continue;
                 }

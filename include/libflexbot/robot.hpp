@@ -61,10 +61,11 @@ private:
     void load_config(const std::string &path);
     void worker_loop();
     bool update_feedback_from_frame(const CanFD::RxFrame &frame);
-    bool wait_for_feedback(uint32_t id, std::string &reason);
+    bool wait_for_feedback(uint32_t id, std::string &reason, std::chrono::milliseconds window);
     bool check_errors(std::string &reason) const;
     bool check_soft_limits(std::string &reason) const;
     void send_start_sequence();
+    void drain_receive();
     void seed_mode_commands();
     void send_disable_all();
     bool send_special(uint32_t id, uint8_t tail);
